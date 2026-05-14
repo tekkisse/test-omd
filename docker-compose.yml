@@ -1,0 +1,231 @@
+version: "3.9"
+
+# ---------------------------------------------------------------------------
+# Local development / test stack
+#
+# Services
+#   Infrastructure  : rabbitmq, mysql, opensearch
+#   Site A          : site_a_omd, webhook_receiver_site_a
+#   Site B          : site_b_omd, webhook_receiver_site_b
+#   Central         : central_omd, central_consumer
+#
+# Startup order is enforced via depends_on health checks — no service starts
+# until its dependencies report healthy.
+#
+# Resource note: three OMD JVMs + OpenSearch need ~8 GB RAM.
+# Reduce JVM heap via OPENMETADATA_HEAP_OPTS if constrained.
+#
+# First-run note: OMD runs DB migrations on startup, which can take 3–5 min.
+# The service_healthy condition on OMD instances means dependent services
+# will not start until migrations complete and the API responds.
+#
+# Central OMD token: after first boot, obtain a JWT with:
+#   curl -s -X POST http://localhost:8587/api/v1/users/login \
+#     -H "Content-Type: application/json" \
+#     -d '{"email":"admin@open-metadata.org","password":"Admin@1234"}' \
+#     | python -m json.tool
+# Then set CENTRAL_OMD_TOKEN in the central_consumer section below.
+#
+# In production, each webhook_receiver runs inside its own site network;
+# only RabbitMQ needs to be reachable between sites and the central host.
+# ---------------------------------------------------------------------------
+
+x-omd-common: &omd-common
+  image: openmetadata/server:1.5.4
+  # Run DB migrations first, then start the server in the foreground.
+  # WORKDIR is /opt/openmetadata; migrate via the bootstrap ops script, then
+  # start without -daemon so the process stays in the foreground for Docker.
+  command:
+    - "-c"
+    - "./bootstrap/openmetadata-ops.sh migrate && ./bin/openmetadata-server-start.sh ./conf/openmetadata.yaml"
+  depends_on:
+    mysql:
+      condition: service_healthy
+    opensearch:
+      condition: service_healthy
+  restart: on-failure
+  healthcheck:
+    test: ["CMD-SHELL", "wget -q --spider http://localhost:8585/api/v1/system/config || exit 1"]
+    interval: 15s
+    timeout: 10s
+    retries: 20
+    start_period: 300s   # first-run migrations can take 5+ minutes
+
+x-omd-env: &omd-env
+  # Database (shared MySQL, separate databases per instance)
+  DB_HOST: mysql
+  DB_PORT: "3306"
+  DB_USER: openmetadata_user
+  DB_USER_PASSWORD: openmetadata_password
+  DB_SCHEME: mysql
+  DB_USE_SSL: "false"
+  # OpenSearch (shared; each OMD uses a different index prefix)
+  SEARCH_TYPE: opensearch
+  ELASTICSEARCH_HOST: opensearch
+  ELASTICSEARCH_PORT: "9200"
+  ELASTICSEARCH_SCHEME: http
+  ELASTICSEARCH_TRUST_ALL_CERTS: "true"
+  # Auth
+  AUTHENTICATION_PROVIDER: basic
+  # Disable Airflow integration (not needed for sync testing)
+  PIPELINE_SERVICE_CLIENT_ENABLED: "false"
+
+
+services:
+
+  # ===========================================================================
+  # Infrastructure
+  # ===========================================================================
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"    # management UI  →  http://localhost:15672  (omd / omd_secret)
+    environment:
+      RABBITMQ_DEFAULT_USER: omd
+      RABBITMQ_DEFAULT_PASS: omd_secret
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  mysql:
+    image: mysql:8.0
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./mysql-init/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot_password"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  opensearch:
+    image: opensearchproject/opensearch:2.13.0
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -qv '\"status\":\"red\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # ===========================================================================
+  # Site A — OpenMetadata + webhook receiver
+  # ===========================================================================
+
+  site_a_omd:
+    <<: *omd-common
+    environment:
+      <<: *omd-env
+      OM_DATABASE: openmetadata_site_a
+      ELASTICSEARCH_INDEX_SUFFIX: _site_a    # keeps indices separate from other instances
+      SERVER_HOST_API_URL: http://site_a_omd:8585/api
+    ports:
+      - "8585:8585"    # OMD UI  →  http://localhost:8585
+
+  webhook_receiver_site_a:
+    build:
+      context: .
+      dockerfile: webhook_receiver/Dockerfile
+    environment:
+      SITE_CODE: SITE_A
+      RABBITMQ_URL: amqp://omd:omd_secret@rabbitmq:5672/
+      RABBITMQ_EXCHANGE: omd.sync
+      WEBHOOK_SECRET: ""    # set to match the OMD Event Subscription secret
+      PORT: "8080"
+    ports:
+      - "8081:8080"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      site_a_omd:
+        condition: service_healthy
+    restart: on-failure
+
+  # ===========================================================================
+  # Site B — OpenMetadata + webhook receiver
+  # ===========================================================================
+
+  site_b_omd:
+    <<: *omd-common
+    environment:
+      <<: *omd-env
+      OM_DATABASE: openmetadata_site_b
+      ELASTICSEARCH_INDEX_SUFFIX: _site_b
+      SERVER_HOST_API_URL: http://site_b_omd:8585/api
+    ports:
+      - "8586:8585"    # OMD UI  →  http://localhost:8586
+
+  webhook_receiver_site_b:
+    build:
+      context: .
+      dockerfile: webhook_receiver/Dockerfile
+    environment:
+      SITE_CODE: SITE_B
+      RABBITMQ_URL: amqp://omd:omd_secret@rabbitmq:5672/
+      RABBITMQ_EXCHANGE: omd.sync
+      WEBHOOK_SECRET: ""
+      PORT: "8080"
+    ports:
+      - "8082:8080"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      site_b_omd:
+        condition: service_healthy
+    restart: on-failure
+
+  # ===========================================================================
+  # Central — OpenMetadata + sync consumer
+  # ===========================================================================
+
+  central_omd:
+    <<: *omd-common
+    environment:
+      <<: *omd-env
+      OM_DATABASE: openmetadata_central
+      ELASTICSEARCH_INDEX_SUFFIX: _central
+      SERVER_HOST_API_URL: http://central_omd:8585/api
+    ports:
+      - "8587:8585"    # OMD UI  →  http://localhost:8587
+
+  central_consumer:
+    build:
+      context: .
+      dockerfile: central_consumer/Dockerfile
+    environment:
+      RABBITMQ_URL: amqp://omd:omd_secret@rabbitmq:5672/
+      RABBITMQ_EXCHANGE: omd.sync
+      RABBITMQ_QUEUE: omd.central.sync
+      RABBITMQ_ROUTING_KEY: "#"
+      RABBITMQ_PREFETCH: "10"
+      CENTRAL_OMD_URL: http://central_omd:8585
+      CENTRAL_OMD_TOKEN: ""    # see top-of-file instructions for obtaining this
+      DELETION_STRATEGY: soft_delete
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      central_omd:
+        condition: service_healthy
+    restart: on-failure
+
+
+volumes:
+  mysql_data:
+  opensearch_data:
